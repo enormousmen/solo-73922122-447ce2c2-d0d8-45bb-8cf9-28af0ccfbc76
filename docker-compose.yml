@@ -10,6 +10,17 @@ services:
       CONFIG_PATH: /app/config/default.json
       # Set to 1 only for chaos testing (enables POST /test/crash).
       ENABLE_TEST_CRASH_ENDPOINT: "0"
+      # --- Optional checkpoint encryption (AES-256-GCM) -------------------
+      # Supply a Base64-encoded 32-byte key to encrypt every checkpoint
+      # written to the shared volume. Generate one with:
+      #   python3 -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
+      # Recommended: put CHECKPOINT_ENCRYPTION_KEY=<base64-key> into a local
+      # .env file (chmod 600), which docker compose loads automatically; or
+      # export it in the shell before `docker compose up`. Leave it unset to
+      # keep encryption disabled (legacy plaintext checkpoints still work).
+      # Never change or drop the key while an encrypted checkpoint exists in
+      # the trainer-runs volume.
+      CHECKPOINT_ENCRYPTION_KEY: "${CHECKPOINT_ENCRYPTION_KEY:-}"
     volumes:
       # Checkpoints survive `docker kill` + `docker compose start`.
       - trainer-runs:/app/runs

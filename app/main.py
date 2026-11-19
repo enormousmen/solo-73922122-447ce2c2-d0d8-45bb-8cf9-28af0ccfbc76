@@ -4,13 +4,19 @@ Endpoints (interactive docs at /docs):
 
     GET  /                     service info
     GET  /config               effective default config + runtime info
+                               (incl. checkpoint encryption status)
     POST /train/start          start a fresh run (optional config overrides, force)
     POST /train/pause          stop training; 200 only after a full checkpoint is persisted
     POST /train/resume         continue from the latest checkpoint / paused state
-    GET  /train/status         progress and checkpoint health
+    GET  /train/status         progress, checkpoint health and encryption state
     GET  /train/losses         per-batch loss history
     GET  /train/parameters     download model parameters (.pt) from latest checkpoint
-    GET  /train/checkpoint     download the full checkpoint (.pt)
+    GET  /train/checkpoint     download the full checkpoint (.pt; ciphertext frame
+                               when CHECKPOINT_ENCRYPTION_KEY is set)
+
+Optional checkpoint encryption: set CHECKPOINT_ENCRYPTION_KEY to the Base64
+encoding of exactly 32 bytes to persist every checkpoint with AES-256-GCM
+(fresh nonce per save, plaintext never written to disk).  See app/crypto.py.
 """
 from __future__ import annotations
 
@@ -24,8 +30,10 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 
 from .config import load_default_config
+from .crypto import KEY_ENV_VAR, CheckpointKeyError, load_encryption_key
 from .trainer import (
     CheckpointSaveError,
+    CheckpointSecurityError,
     ConflictError,
     JobManager,
     NotFoundError,
@@ -39,7 +47,13 @@ manager: JobManager
 async def lifespan(app: FastAPI):
     global manager
     runs_dir = os.environ.get("RUNS_DIR", "runs")
-    manager = JobManager(runs_dir=runs_dir, default_config=load_default_config())
+    # Fail fast on a malformed key instead of discovering it at first save.
+    try:
+        encryption_key = load_encryption_key()
+    except CheckpointKeyError as exc:
+        raise RuntimeError(f"invalid checkpoint encryption configuration: {exc}") from exc
+    manager = JobManager(runs_dir=runs_dir, default_config=load_default_config(),
+                         encryption_key=encryption_key)
     yield
 
 
@@ -93,6 +107,11 @@ def get_config() -> dict:
         "runs_dir": str(manager.runs_dir),
         "torch_version": torch.__version__,
         "torch_num_threads": torch.get_num_threads(),
+        "checkpoint_encryption": {
+            "enabled": manager.encryption_enabled,
+            "algorithm": "AES-256-GCM" if manager.encryption_enabled else None,
+            "key_env_var": KEY_ENV_VAR,
+        },
     }
 
 
@@ -104,6 +123,8 @@ def start(body: dict[str, Any] | None = Body(default=None)) -> dict:
     overrides = body.get("config") or {}
     try:
         return manager.start(overrides=overrides, force=force)
+    except CheckpointSecurityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ConflictError as exc:
         raise _conflict(exc) from exc
     except ValueError as exc:
@@ -130,6 +151,8 @@ def resume() -> dict:
     run at a time: concurrent resumes yield exactly one 200 and 409s."""
     try:
         return manager.resume()
+    except CheckpointSecurityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ConflictError as exc:
@@ -154,6 +177,8 @@ def parameters() -> Response:
     """Download current model parameters (.pt) from the latest checkpoint."""
     try:
         data = manager.read_parameters()
+    except CheckpointSecurityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return Response(

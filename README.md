@@ -15,7 +15,8 @@ FastAPI + CPU 版 PyTorch 实现的**单作业训练服务**。训练工程师�
 app/
   main.py        # FastAPI 入口（/docs 自动生成）
   trainer.py     # 单作业状态机 + 确定性训练循环 + 暂停/续训
-  checkpoint.py  # 原子检查点读写（tmp + fsync + rename）
+  checkpoint.py  # 原子检查点读写（tmp + fsync + rename），支持透明加解密
+  crypto.py      # AES-256-GCM 检查点静态加密（环境变量密钥、帧格式、校验）
   config.py      # 默认配置加载与校验
   dataset.py     # 固定 CSV 数据集加载
   model.py       # 两层 FC + Dropout
@@ -23,6 +24,7 @@ config/default.json      # 默认训练配置
 data/classification.csv  # 固定分类数据集（scripts/generate_data.py 生成）
 scripts/generate_data.py # 数据集生成脚本（固定种子，仅作溯源）
 scripts/verify_repro.py  # 端到端验证：不中断对照 / 暂停续训 / 强退恢复 等
+scripts/verify_encryption.py # 加密专项端到端验证（密钥缺失/错误、明文点拒绝等）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -89,6 +91,74 @@ curl -OJ localhost:8000/train/checkpoint     # checkpoint.pt
 `failed`）。`paused` 表示训练已停、可续训；`checkpoint_dirty=true` 表示内存进度
 领先于磁盘（上次保存失败），此时重启进程会回退到磁盘上的旧检查点。
 
+## 检查点静态加密（AES-256-GCM，可选）
+
+共享卷里的 `checkpoint.pt` 可能被备份系统或其他容器直接读取。服务支持对**完整
+检查点**（模型参数、Adam 优化器状态、RNG、损失历史、配置）做静态加密，明文只存在
+于进程内存中，磁盘上的最终文件与写入过程中的临时文件都**只有密文**。
+
+### 密钥配置（本地）
+
+密钥从环境变量 `CHECKPOINT_ENCRYPTION_KEY` 读取，内容是 **32 字节随机密钥的
+Base64 编码**（解码后必须恰好 32 字节，否则进程启动即失败，不会回退为明文）：
+
+```bash
+# 1) 生成密钥
+python3 -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
+
+# 2a) 本地直接运行：导出环境变量后启动
+export CHECKPOINT_ENCRYPTION_KEY='<上一步输出的 base64>'
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# 2b) Docker Compose：写入本地 .env（不要提交到版本库），compose 会自动加载
+printf 'CHECKPOINT_ENCRYPTION_KEY=%s\n' '<base64>' > .env
+chmod 600 .env
+docker compose up --build
+# 或者直接在 shell 中 export 同名变量，docker-compose.yml 中的
+# ${CHECKPOINT_ENCRYPTION_KEY:-} 会透传给容器；留空/不设置 = 不启用加密。
+```
+
+启用后 `GET /config` 的 `checkpoint_encryption.enabled=true`、
+`algorithm="AES-256-GCM"`；`GET /train/status` 增加 `encryption_enabled`、
+`checkpoint_encrypted` 与 `recovery_error` 字段。
+
+### 磁盘格式与安全语义
+
+- 帧格式：`magic "RPCKENC1"(8B) + nonce(12B) + GCM tag(16B) + 密文`，magic 同时
+  作为 GCM 的 AAD，并用于区分旧版明文点（torch ZIP 以 `PK\x03\x04` 开头）。
+- **每次保存都用 `os.urandom` 生成新 nonce**，同一现场重复保存的密文也不同。
+- 加密写入与明文模式共用同一套 tmp → fsync → `os.replace` → 目录 fsync 的原子
+  流程；加密/写入失败只清理临时文件，**旧检查点原样保留**，可重试。
+- 强退/断电后重启，磁盘上只会是完整的旧密文点或完整的新密文点，启动时清理残留
+  临时文件；恢复、暂停后续训、参数/检查点下载仍针对**最近成功保存的同一现场**，
+  同配置续训的逐批损失与参数逐位一致（加密只改变持久化编码，不改变内存现场）。
+- 明确拒绝（HTTP 409，`state=failed` 且 `status.recovery_error` 给出原因）且
+  **绝不覆盖原文件**的情形：
+  - 密文点存在但未配置密钥（"no key is set"）；
+  - 密钥错误 / 文件被篡改（GCM 认证失败，"failed to decrypt and authenticate"）；
+  - 启用加密时发现旧的**明文**检查点（"plaintext ... refusing to load or
+    overwrite"，`force=true` 同样拒绝）。
+  - 处置方式：用正确密钥重启即可恢复；确认明文点不再需要时，由人工把
+    `checkpoint.pt` 移出 `RUNS_DIR` 后再启动新加密作业（服务本身不提供删除
+    接口）。
+- **不启用加密时**（环境变量未设置或为空），旧明文目录的行为与之前完全一致，
+  可直接恢复与续训。
+- `GET /train/checkpoint` 下载的是磁盘上的原始密文帧（备份语义不变，不含明文）；
+  `GET /train/parameters` 在进程内存中解密后返回普通 `.pt` 参数字典。
+- 密钥是静态机密：请通过 `.env`（权限 600）/宿主机环境变量/密钥管理系统注入，
+  不要写进镜像或提交到版本库；丢失密钥等于检查点不可恢复。
+
+### 加密专项自测
+
+```bash
+python3 scripts/verify_encryption.py   # 36 项检查，覆盖下列 I1–I13 场景
+```
+
+覆盖：启用状态上报、磁盘与临时文件无明文、每次保存 nonce 唯一、暂停/强退恢复后
+与不中断加密基线逐位一致、缺密钥/错密钥/明文点全部 409 拒绝且文件不被覆盖、
+换回正确密钥后可恢复、未启用时旧明文目录可用、密文/明文下载语义、畸形密钥启动
+失败、加密保存失败保留旧点。
+
 ## 可复现性设计（为什么恢复后逐位一致）
 
 1. **单线程 + 确定性算子**：`torch.set_num_threads(1)` 并开启
@@ -120,6 +190,7 @@ A 不中断基线；B 暂停+续训；C 强退+重启+续训；D 并发续训只
 E1 保存失败→报错→旧点保留→重试成功；E2 保存失败后强退→回退旧点恢复；
 F 慢保存不挡查询；G 保存进行中强退→恢复完整旧/新点；H 基础接口与 /docs。
 B–E、G 的逐批损失与最终参数均与各自不中断基线**逐位一致**才判通过。
+加密模式另有 `scripts/verify_encryption.py`（36 项，见上节）。
 
 > 本环境的 seccomp 策略禁止向其他进程发信号，脚本用 `ENABLE_TEST_CRASH_ENDPOINT=1`
 > 开启的测试专用 `POST /test/crash`（`os._exit`，立即死亡、无任何清理）模拟强退；
@@ -233,3 +304,25 @@ curl -s localhost:8000/train/status    # 直至 state=finished
   测使用完全相同的启动命令与依赖版本，但未在真实 Docker 中跑过验证脚本。
 - 暂停等待上限为 `pause_timeout_seconds`（默认 30s），超时返回 504，训练仍会
   在批边界停下，可轮询状态确认。
+- 加密限制：单一对称密钥，未做密钥轮换 / 多密钥 / KMS 集成；服务不提供删除或
+  "明文→密文"迁移接口，模式不匹配时只拒绝并保留原文件，需人工处置；密钥丢失
+  后密文检查点在密码学上不可恢复。
+
+## 本次加密改动的实测结果
+
+在本仓库环境实际执行（torch 2.15.0+cpu / fastapi 0.163.1 / cryptography 44.0.3）：
+
+- `python3 scripts/verify_repro.py`：**33/33 通过**（明文模式行为无回归）。
+- `python3 scripts/verify_encryption.py`：**36/36 通过**，覆盖：
+  - 畸形密钥（非法 Base64、长度≠32 字节）进程启动即失败；
+  - 启用后 `/config`、`/train/status` 正确上报加密状态；
+  - 磁盘 `checkpoint.pt` 与所有临时文件均为 `RPCKENC1` 密文帧，无 torch ZIP
+    头/明文张量标记泄漏；每次保存 nonce 不同；
+  - 加密下暂停→续训、强退→同密钥重启→续训，逐批损失与最终参数相对不中断
+    加密基线**逐位一致**；
+  - 密文点缺密钥 / 错密钥（GCM 认证失败）/ 启用加密遇明文点（含 paused 未完成
+    点）：加载、start（含 `force=true`）、resume、参数下载全部明确 409 拒绝，
+    原文件哈希不变；换回正确密钥后立即恢复；
+  - 未启用加密时旧明文目录正常恢复与下载；
+  - `/train/checkpoint` 下载与磁盘密文逐字节相同，`/train/parameters` 内存解密
+    返回可加载的 `.pt`；加密保存失败时旧密文点完整保留、重试成功。

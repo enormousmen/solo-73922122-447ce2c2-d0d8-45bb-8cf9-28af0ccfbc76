@@ -38,12 +38,14 @@ import torch.nn.functional as F
 
 from .checkpoint import (
     CheckpointError,
+    checkpoint_is_encrypted,
     checkpoint_path,
     cleanup_stale_tmp_files,
     load_checkpoint,
     save_checkpoint,
 )
 from .config import TrainConfig
+from .crypto import CheckpointCryptoError
 from .dataset import load_classification_csv
 from .model import build_model
 
@@ -73,6 +75,12 @@ class CheckpointSaveError(Exception):
     """500 - pause could not persist a complete checkpoint."""
 
 
+class CheckpointSecurityError(Exception):
+    """409 - checkpoint cannot be used under the current encryption mode
+    (missing/wrong key for an encrypted checkpoint, or a plaintext checkpoint
+    found while encryption is enabled).  The on-disk file is never modified."""
+
+
 def epoch_permutation(seed: int, epoch: int, n: int) -> list[int]:
     """Deterministic per-epoch shuffle, re-derivable after a restart."""
     rng = random.Random(f"{seed}:{epoch}")
@@ -86,7 +94,8 @@ def _now_iso() -> str:
 
 
 class JobManager:
-    def __init__(self, runs_dir: str, default_config: TrainConfig):
+    def __init__(self, runs_dir: str, default_config: TrainConfig,
+                 encryption_key: bytes | None = None):
         # Bit-exact CPU reproducibility: fixed thread count + deterministic ops.
         torch.set_num_threads(1)
         try:
@@ -97,6 +106,9 @@ class JobManager:
         self.runs_dir = Path(runs_dir)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.default_config = default_config
+        # None -> encryption disabled (legacy plaintext checkpoints allowed).
+        self.encryption_key = encryption_key
+        self.encryption_enabled = encryption_key is not None
 
         self._cond = threading.Condition()      # guards all mutable fields below
         self._save_lock = threading.Lock()      # serializes checkpoint writes
@@ -128,6 +140,12 @@ class JobManager:
         self.started_at: str | None = None
         self._saved_point: tuple[int, int] | None = None
         self._resume_rng_state = None
+        # Set when a checkpoint exists on disk but cannot be used under the
+        # current encryption mode (missing/wrong key, plaintext while
+        # encryption enabled).  Blocks start/resume until resolved; the file
+        # itself is never overwritten.
+        self.recovery_error: str | None = None
+        self.checkpoint_encrypted: bool | None = None
 
     def _load_dataset(self) -> None:
         path = self.default_config.dataset_path
@@ -146,7 +164,22 @@ class JobManager:
         removed = cleanup_stale_tmp_files(self.runs_dir)
         if removed:
             print(f"[trainer] removed stale temp checkpoint files: {removed}")
-        ckpt = load_checkpoint(self.runs_dir)
+        on_disk = checkpoint_is_encrypted(self.runs_dir)
+        if on_disk is None:
+            return
+        self.checkpoint_encrypted = bool(on_disk)
+        try:
+            ckpt = load_checkpoint(self.runs_dir, key=self.encryption_key)
+        except CheckpointCryptoError as exc:
+            # Encrypted point without/with wrong key, or a plaintext point
+            # while encryption is enabled: refuse to load, keep the file
+            # untouched and block every run-changing command until resolved.
+            self.recovery_error = str(exc)
+            self.state = JobState.FAILED
+            self.last_error = f"checkpoint unusable under current encryption " \
+                              f"mode: {exc}"
+            print(f"[trainer] {self.last_error}")
+            return
         if ckpt is None:
             return
         self.cfg = TrainConfig.from_dict(ckpt["config"])
@@ -172,12 +205,18 @@ class JobManager:
         self.recovered = True
         print(f"[trainer] recovered checkpoint run={self.run_id} "
               f"epoch={self.epoch} next_batch={self.next_batch} "
-              f"completed={self.completed}")
+              f"completed={self.completed} "
+              f"encrypted={self.checkpoint_encrypted}")
 
     # --------------------------------------------------------------- commands
 
     def start(self, overrides: dict | None = None, force: bool = False) -> dict:
         with self._cond:
+            if self.recovery_error is not None:
+                # An on-disk checkpoint cannot be used under the current
+                # encryption mode.  Even force=true is refused: we never
+                # overwrite a point we cannot read.
+                raise CheckpointSecurityError(self.recovery_error)
             if self.state in (JobState.RUNNING, JobState.PAUSING):
                 raise ConflictError("training is already running")
             if self.run_id is not None and not force:
@@ -194,8 +233,11 @@ class JobManager:
             self._build_training_objects()
             self.run_id = uuid.uuid4().hex[:12]
             self.started_at = _now_iso()
-            # A fresh run replaces any previous checkpoint on disk.
+            # A fresh run replaces any previous (mode-compatible) checkpoint on
+            # disk.  Reachable only when no recovery_error blocks us, so an
+            # unreadable point can never be overwritten from here.
             checkpoint_path(self.runs_dir).unlink(missing_ok=True)
+            self.checkpoint_encrypted = self.encryption_enabled
             self.state = JobState.RUNNING
             self._pause_requested = False
             self._thread = threading.Thread(target=self._train_loop,
@@ -205,6 +247,8 @@ class JobManager:
 
     def resume(self) -> dict:
         with self._cond:
+            if self.recovery_error is not None:
+                raise CheckpointSecurityError(self.recovery_error)
             if self.state in (JobState.RUNNING, JobState.PAUSING):
                 raise ConflictError("training is already running")
             if self.run_id is None or self.cfg is None:
@@ -368,6 +412,7 @@ class JobManager:
                 self.saving = True
             try:
                 save_checkpoint(self.runs_dir, payload,
+                                key=self.encryption_key,
                                 save_delay_seconds=self.cfg.checkpoint_sleep_seconds)
             except CheckpointError as exc:
                 with self._cond:
@@ -405,6 +450,9 @@ class JobManager:
                 "progress": (done / total) if total else 0.0,
                 "saving": self.saving,
                 "checkpoint_dirty": self.checkpoint_dirty,
+                "checkpoint_encrypted": self.checkpoint_encrypted,
+                "encryption_enabled": self.encryption_enabled,
+                "recovery_error": self.recovery_error,
                 "last_checkpoint_at": self.last_checkpoint_at,
                 "last_error": self.last_error,
                 "started_at": self.started_at,
@@ -428,8 +476,16 @@ class JobManager:
         return {"count": total, "returned": len(losses), "losses": losses}
 
     def read_parameters(self) -> bytes:
-        """Model parameters from the latest persisted checkpoint, as a .pt file."""
-        ckpt = load_checkpoint(self.runs_dir)
+        """Model parameters from the latest persisted checkpoint, as a .pt file.
+
+        Encrypted checkpoints are decrypted in process memory; the response
+        contains a plain torch state_dict while the on-disk backup stays
+        encrypted.
+        """
+        try:
+            ckpt = load_checkpoint(self.runs_dir, key=self.encryption_key)
+        except CheckpointCryptoError as exc:
+            raise CheckpointSecurityError(str(exc)) from exc
         if ckpt is None:
             raise NotFoundError("no checkpoint exists yet; train first")
         buf = io.BytesIO()
@@ -437,6 +493,12 @@ class JobManager:
         return buf.getvalue()
 
     def checkpoint_file(self) -> Path:
+        """Path to the latest persisted checkpoint.
+
+        With encryption enabled the downloaded bytes are the AES-256-GCM
+        encrypted frame (the raw backup is never decrypted on disk); use
+        ``GET /train/parameters`` or the matching key to read it.
+        """
         path = checkpoint_path(self.runs_dir)
         if not path.exists():
             raise NotFoundError("no checkpoint exists yet; train first")
